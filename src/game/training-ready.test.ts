@@ -8,7 +8,7 @@ import { runCoworldPlayer } from "@cogweb/coworld";
 import { runCoworldGame } from "../coworld/server.js";
 import { territoryModule } from "./game.js";
 import { TrainingSession } from "./training-bridge.js";
-import { makeLlmDecide, makeScriptedDecide } from "./player.js";
+import { makeLlmDecide, makeScriptedDecide, selectPlayerPolicy } from "./player.js";
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -65,7 +65,7 @@ it("completes the real nine-seat production loop with exact private attempts and
     },
   });
   try {
-    const decide = makeLlmDecide("private doctrine", "homesteader");
+    const decide = makeLlmDecide("private doctrine");
     const players = host.playerUrls.map((connect) =>
       runCoworldPlayer({ module: territoryModule, connect, decide }),
     );
@@ -149,7 +149,7 @@ it("consumes exhausted parser and engine retries with explicit engine fallbacks"
   const consumed = parser.step(0, "not JSON");
   expect(consumed.kind).toBe("consumed_rejection");
   if (consumed.kind === "consumed_rejection") {
-    expect(consumed.action.fallback).toBe(true);
+    expect(consumed.action).toEqual({ orders: [], messages: [], fallback: true });
     expect(consumed.observation.kind).toBe("decision");
     if (consumed.observation.kind === "decision") expect(consumed.observation.decision_id).toBe(1);
   }
@@ -159,8 +159,93 @@ it("consumes exhausted parser and engine retries with explicit engine fallbacks"
   });
   const invalid = '{"orders":[{"type":"claim","tile":"999,999"}]}';
   expect(engine.step(0, invalid).kind).toBe("rejected");
-  expect(engine.step(0, invalid).kind).toBe("consumed_rejection");
+  const engineConsumed = engine.step(0, invalid);
+  expect(engineConsumed.kind).toBe("consumed_rejection");
+  if (engineConsumed.kind === "consumed_rejection") {
+    expect(engineConsumed.action).toEqual({ orders: [], messages: [], fallback: true });
+  }
 });
+
+it("routes scored learners to empty hold on invalid output while preserving explicit scripted opponents", async () => {
+  expect(selectPlayerPolicy({ PLAYER_SCRIPTED: "raider", COWORLD_LLM_ENDPOINT: "http://x" })).toEqual({
+    kind: "scripted",
+    baseline: "raider",
+  });
+  expect(selectPlayerPolicy({ COWORLD_LLM_ENDPOINT: "http://x" })).toEqual({
+    kind: "llm",
+    prompt: "",
+  });
+  expect(selectPlayerPolicy({ PLAYER_PROMPT: "hold walls" })).toEqual({
+    kind: "llm",
+    prompt: "hold walls",
+  });
+  expect(selectPlayerPolicy({})).toEqual({ kind: "scripted", baseline: "homesteader" });
+
+  const directory = await mkdtemp(join(tmpdir(), "territory-invalid-learner-"));
+  vi.stubEnv("COGAME_RESULTS_URI", join(directory, "results.json"));
+  vi.stubEnv("COGAME_SAVE_REPLAY_URI", join(directory, "replay.json"));
+  vi.stubEnv("COGAME_SAVE_TRAJECTORY_URI", join(directory, "trajectory.jsonl"));
+  let learnerCalls = 0;
+  const inference = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      learnerCalls++;
+      const response = {
+        model: "fixture/broken-learner",
+        choices: [{ message: { content: "not valid json" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      };
+      res.writeHead(200, { "content-type": "application/json", "X-Softmax-Llm-Call-Id": randomUUID() });
+      res.end(JSON.stringify(response));
+    });
+  });
+  await new Promise<void>((resolve) => inference.listen(0, "127.0.0.1", resolve));
+  const address = inference.address();
+  if (typeof address === "string" || address === null)
+    throw new Error("Fixture requires an IP listener");
+  vi.stubEnv("COWORLD_LLM_ENDPOINT", `http://127.0.0.1:${address.port}`);
+  vi.stubEnv("COWORLD_LLM_MODEL", "fixture/broken-learner");
+  const turns = 4;
+  const host = await runCoworldGame({
+    host: "127.0.0.1",
+    port: 0,
+    config: {
+      tokens: Array.from({ length: 9 }, (_, seat) => `mixed-${seat}`),
+      players: Array.from({ length: 9 }, (_, seat) => ({ name: seat === 0 ? "learner" : `bot-${seat}` })),
+      seed: 13,
+      paceMs: 0,
+      turns,
+    },
+  });
+  try {
+    const players = host.playerUrls.map((connect, seat) =>
+      runCoworldPlayer({
+        module: territoryModule,
+        connect,
+        decide: seat === 0 ? makeLlmDecide("private doctrine") : makeScriptedDecide(seat % 2 === 0 ? "raider" : "homesteader"),
+      }),
+    );
+    await Promise.all([host.finished, Promise.all(players)]);
+    expect(learnerCalls).toBe(turns * 2);
+    const results = JSON.parse(await readFile(join(directory, "results.json"), "utf8"));
+    expect(results.fallbacks[0]).toBe(turns);
+    expect(results.fallbacks.slice(1)).toEqual(Array(8).fill(0));
+    const trajectory = JSON.parse(await readFile(join(directory, "trajectory.jsonl"), "utf8"));
+    const learnerDecisions = trajectory.decisions.filter((d: { seat: string }) => d.seat === "0");
+    expect(learnerDecisions).toHaveLength(turns);
+    for (const d of learnerDecisions) {
+      expect(d.action_status).toBe("fallback");
+      expect(d.executed_action).toEqual({ orders: [], messages: [], fallback: true });
+    }
+    const opponentDecisions = trajectory.decisions.filter((d: { seat: string }) => d.seat !== "0");
+    expect(opponentDecisions.some((d: { executed_action: { orders: unknown[] } }) => d.executed_action.orders.length > 0)).toBe(true);
+  } finally {
+    await host.close();
+    await new Promise<void>((resolve, reject) =>
+      inference.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+}, 30000);
 
 it("records complete selected scripted controls without model provenance", async () => {
   const directory = await mkdtemp(join(tmpdir(), "territory-scripted-training-"));

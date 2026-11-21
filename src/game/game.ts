@@ -192,7 +192,7 @@ export const territoryGame: Game<TerritorySeamState, TerritoryDecision, Territor
   /** An empty order set — a legal hold for any seat, any turn. Flagged as a
    *  fallback so `results.fallbacks[seat]` counts it. */
   baselineDecision(): TerritoryDecision {
-    return { orders: [], messages: [], fallback: true };
+    return emptyHoldDecision();
   },
 
   /** The host's wall-clock guard: settle now, write everything, never overrun.
@@ -202,6 +202,10 @@ export const territoryGame: Game<TerritorySeamState, TerritoryDecision, Territor
     return { ...s, engine: settleEarly(s.engine, reason as EndReason) };
   },
 };
+
+export function emptyHoldDecision(): TerritoryDecision {
+  return { orders: [], messages: [], fallback: true };
+}
 
 export const territoryModule: GameModule<TerritorySeamState, TerritoryDecision, TerritoryView> = {
   game: territoryGame,
