@@ -4,7 +4,7 @@ import { argv } from "node:process";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { parseJsonAction } from "@cogweb/llm";
-import { territoryGame, type TerritorySeamState } from "./game.js";
+import { emptyHoldDecision, territoryGame, type TerritorySeamState } from "./game.js";
 import { renderPlayerMessages, SUBMISSION_JSON_SCHEMA } from "./prompt.js";
 import { scriptedDecide } from "./scripted.js";
 import type { TerritoryObservation } from "./redact.js";
@@ -104,12 +104,7 @@ export class TrainingSession {
     this.parseReason = reason;
     if (this.localAttempts < 2)
       return { kind: "rejected" as const, reason, observation: this.observation() };
-    const current = this.observation();
-    if (current.kind !== "decision") throw new Error("Fallback requires a live turn");
-    return this.apply(
-      { ...scriptedDecide("homesteader", current.semantic_view), fallback: true },
-      reason,
-    );
+    return this.apply(emptyHoldDecision(), reason);
   }
   private apply(action: Submission, consumedReason: string | null) {
     const seat = territoryGame.pendingActors(this.state)[0]!;
