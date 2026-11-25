@@ -15,10 +15,61 @@ import type { ActAttempt, TextGeneration, GenerationPurpose } from "@cogweb/prot
 import { isCredentialsUnavailable } from "./openrouter.js";
 import type { OpenRouterLlmClient, LlmMessage } from "./openrouter.js";
 
+function parsePlainObject(raw: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(raw);
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Parse a primary native JSON object reply, optionally wrapped in a single
- * fenced code block. Never scrapes braces out of surrounding prose, and rejects
- * ambiguous multi-block or competing-JSON replies so raw output is preserved.
+ * Scan text outside fenced blocks for any balanced `{...}` substring that parses
+ * as a JSON object (ignoring non-JSON braces in narrative prose like `claim {tile}`).
+ */
+function hasJsonObjectInText(text: string): boolean {
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"' && depth > 0) {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === "}" && depth > 0) {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        if (parsePlainObject(text.slice(start, i + 1)) !== null) return true;
+        start = -1;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Parse a primary native JSON object reply, or a single clearly fenced JSON
+ * action block even when surrounded by narrative prose or non-action code blocks.
+ * Never scrapes braces out of surrounding prose, and rejects incomplete JSON or
+ * multiple competing JSON blocks so raw output is preserved.
  */
 export function parseJsonAction(
   text: string,
@@ -26,34 +77,47 @@ export function parseJsonAction(
   const trimmed = text.trim();
   if (!trimmed) return { kind: "rejected", reason: "empty reply" };
 
-  const parsePlainObject = (raw: string): unknown | null => {
-    try {
-      const value: unknown = JSON.parse(raw);
-      return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
-    } catch {
-      return null;
-    }
-  };
-
   if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
     const direct = parsePlainObject(trimmed);
     if (direct !== null) return { kind: "parsed", value: direct };
     return { kind: "rejected", reason: "invalid JSON object in reply" };
   }
 
-  const fences = [...trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)];
-  if (fences.length > 1) {
-    return { kind: "rejected", reason: "ambiguous reply: multiple fenced blocks" };
+  const fenceRe = /```([a-zA-Z0-9_+-]*)[ \t]*(?:\r?\n)?([\s\S]*?)```/g;
+  const fences = [...trimmed.matchAll(fenceRe)];
+  const outside = trimmed.replace(fenceRe, " ").trim();
+  if (outside.includes("```")) {
+    return { kind: "rejected", reason: "incomplete fenced block" };
   }
-  if (fences.length === 1) {
-    const outside = trimmed.replace(fences[0]![0], "").trim();
-    if (outside.includes("{") || outside.includes("}")) {
+
+  const jsonBlocks: Array<{ explicit: boolean; value: Record<string, unknown> }> = [];
+  for (const match of fences) {
+    const lang = (match[1] ?? "").trim().toLowerCase();
+    const inner = (match[2] ?? "").trim();
+    if (lang === "json") {
+      const parsed = parsePlainObject(inner);
+      if (parsed === null) {
+        return { kind: "rejected", reason: "invalid JSON object in fenced block" };
+      }
+      jsonBlocks.push({ explicit: true, value: parsed });
+    } else if (lang === "") {
+      const parsed = parsePlainObject(inner);
+      if (parsed !== null) {
+        jsonBlocks.push({ explicit: false, value: parsed });
+      }
+    }
+    // Other language-tagged blocks (e.g. ```python, ```text) and untagged non-JSON
+    // blocks (e.g. ASCII tables/scratchpads) are non-action code and ignored.
+  }
+
+  if (jsonBlocks.length > 1) {
+    return { kind: "rejected", reason: "ambiguous reply: multiple fenced JSON blocks" };
+  }
+  if (jsonBlocks.length === 1) {
+    if (hasJsonObjectInText(outside)) {
       return { kind: "rejected", reason: "ambiguous reply: JSON outside fenced block" };
     }
-    const inner = fences[0]![1]!.trim();
-    const parsed = parsePlainObject(inner);
-    if (parsed !== null) return { kind: "parsed", value: parsed };
-    return { kind: "rejected", reason: "invalid JSON object in fenced block" };
+    return { kind: "parsed", value: jsonBlocks[0]!.value };
   }
 
   return { kind: "rejected", reason: "reply must be a JSON object or single fenced JSON block" };

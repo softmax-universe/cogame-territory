@@ -40,7 +40,7 @@ it("completes the real nine-seat production loop with exact private attempts and
         slot === "1" && seen === 0
           ? '{"orders":[{"type":"claim","tile":"0,0"}]}'
           : slot === "0" && seen === 0 && firstTile
-            ? `\`\`\`json\n{"orders":[{"type":"claim","tile":"${firstTile}"}]}\n\`\`\``
+            ? `Planning claim {tile} with non-action code:\n\`\`\`text\n${firstTile}: cost 4\n\`\`\`\n\`\`\`json\n{"orders":[{"type":"claim","tile":"${firstTile}"}]}\n\`\`\``
             : '{"orders":[],"messages":[]}';
       const response = {
         model: "fixture/territory",
@@ -196,7 +196,7 @@ it("fails closed with player_failure.json and retains partial progress on ambigu
   });
   expect(selectPlayerPolicy({})).toEqual({ kind: "scripted", baseline: "homesteader" });
 
-  for (const mode of ["ambiguous", "backend_503", "invalid_model_403"] as const) {
+  for (const mode of ["ambiguous", "incomplete_json", "backend_503", "invalid_model_403"] as const) {
     const directory = await mkdtemp(join(tmpdir(), `territory-fail-${mode}-`));
     const resultsPath = join(directory, "results.json");
     const replayPath = join(directory, "replay.json");
@@ -209,6 +209,7 @@ it("fails closed with player_failure.json and retains partial progress on ambigu
 
     let learnerCalls = 0;
     const rawAmbiguous = '```json\n{"orders":[]}\n```\nor\n```json\n{"orders":[]}\n```';
+    const rawIncomplete = '```json\n{"orders":[{"type":"claim"';
     const inference = createServer((req, res) => {
       req.resume();
       req.on("end", () => {
@@ -238,7 +239,12 @@ it("fails closed with player_failure.json and retains partial progress on ambigu
         res.end(
           JSON.stringify({
             model: "anthropic/claude-haiku-4.5",
-            choices: [{ message: { content: rawAmbiguous }, finish_reason: "stop" }],
+            choices: [
+              {
+                message: { content: mode === "incomplete_json" ? rawIncomplete : rawAmbiguous },
+                finish_reason: "stop",
+              },
+            ],
             usage: { prompt_tokens: 1, completion_tokens: 1 },
           }),
         );
@@ -291,6 +297,8 @@ it("fails closed with player_failure.json and retains partial progress on ambigu
       expect(failedDecision).toBeDefined();
       if (mode === "ambiguous") {
         expect(failedDecision.attempts[0].response).toBe(rawAmbiguous);
+      } else if (mode === "incomplete_json") {
+        expect(failedDecision.attempts[0].response).toBe(rawIncomplete);
       } else if (mode === "backend_503") {
         expect(failedDecision.attempts[0].raw_response).toContain("upstream unavailable");
       } else {

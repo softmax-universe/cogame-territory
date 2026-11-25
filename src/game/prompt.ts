@@ -65,7 +65,7 @@ export const SUBMISSION_JSON_SCHEMA = {
 } as const;
 
 const REPLY_CONTRACT = `REPLY FORMAT
-- Reply with one JSON object (raw JSON or a single \`\`\`json fenced block):
+- Reply with a single JSON object (plain JSON, or one \`\`\`json fenced block at the end of your reply). Do not emit more than one JSON block:
   {"orders": [...], "messages": [...]}
 - \`orders\` (required): 0..${MAX_ORDERS_PER_TURN} entries; [] holds.
   Order entries: {"type":"claim","tile":"q,r"}, {"type":"raze","tile":"q,r"}, or {"type":"transfer","to":"Alias","amount":N}.
@@ -364,7 +364,9 @@ export function renderObservation(view: TerritoryObservation): string {
   }
 
   lines.push("");
-  lines.push(`Return JSON with at most ${view.maxOrders} orders. An empty list holds.`);
+  lines.push(
+    `Return a single JSON object with at most ${view.maxOrders} orders (an empty list holds).`,
+  );
   return lines.join("\n");
 }
 
