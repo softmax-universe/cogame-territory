@@ -143,19 +143,52 @@ describe("native direct text action", () => {
     expect(markFallback).not.toHaveBeenCalled();
   });
 
-  it("parses primary raw JSON or a single fenced block and rejects brace scraping and ambiguity", () => {
+  it("parses plain JSON or one clear fenced JSON action alongside narrative or non-action code, and rejects brace scraping, incomplete JSON, and ambiguity", () => {
     expect(parseJsonAction('{"orders":[]}')).toEqual({ kind: "parsed", value: { orders: [] } });
     expect(parseJsonAction('```json\n{"orders":[{"type":"claim","tile":"1,0"}]}\n```')).toEqual({
       kind: "parsed",
       value: { orders: [{ type: "claim", tile: "1,0" }] },
     });
-    expect(parseJsonAction('I will play {"orders":[]} now.')).toMatchObject({ kind: "rejected" });
+    // Narrative with non-JSON braces and a non-action code block alongside one clear ```json action
     expect(
-      parseJsonAction('```json\n{"orders":[]}\n```\nor\n```json\n{"orders":[]}\n```'),
+      parseJsonAction(
+        'I will use claim {tile} after checking costs:\n```python\ncost = 4 + 4\n```\nFinal move:\n```json\n{"orders":[{"type":"claim","tile":"2,-4"}]}\n```',
+      ),
+    ).toEqual({
+      kind: "parsed",
+      value: { orders: [{ type: "claim", tile: "2,-4" }] },
+    });
+    // Untagged non-JSON scratchpad block next to one clear ```json action
+    expect(
+      parseJsonAction(
+        '```\n2,-4: 4 paint\n3,-4: 4 paint\n```\n```json\n{"orders":[{"type":"claim","tile":"2,-4"}]}\n```',
+      ),
+    ).toEqual({
+      kind: "parsed",
+      value: { orders: [{ type: "claim", tile: "2,-4" }] },
+    });
+    // No brace scraping from narrative prose
+    expect(parseJsonAction('I will play {"orders":[]} now.')).toMatchObject({ kind: "rejected" });
+    // Multiple competing fenced JSON blocks
+    expect(
+      parseJsonAction('```json\n{"orders":[]}\n```\nor\n```json\n{"orders":[{"type":"claim","tile":"1,0"}]}\n```'),
     ).toMatchObject({ kind: "rejected", reason: expect.stringContaining("ambiguous") });
+    // Competing JSON object outside fenced block
     expect(parseJsonAction('Maybe {"orders":[]} or\n```json\n{"orders":[]}\n```')).toMatchObject({
       kind: "rejected",
       reason: expect.stringContaining("ambiguous"),
+    });
+    // Incomplete / truncated fenced JSON or raw JSON
+    expect(parseJsonAction('```json\n{"orders":[{"type":"claim"')).toMatchObject({
+      kind: "rejected",
+      reason: expect.stringContaining("incomplete"),
+    });
+    expect(parseJsonAction('```json\n{"orders":[}\n```')).toMatchObject({
+      kind: "rejected",
+      reason: expect.stringContaining("invalid JSON"),
+    });
+    expect(parseJsonAction('{"orders":[{"type":"claim"')).toMatchObject({
+      kind: "rejected",
     });
   });
 });
