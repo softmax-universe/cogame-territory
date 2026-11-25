@@ -183,7 +183,7 @@ export const TextGeneration = z.object({
   /** Null until a response supplies an observed elapsed duration. */
   latencyMs: z.number().nonnegative().nullable(),
   inferenceMode: z.enum(["text_action", "candidate", "system_one"]).optional(),
-  platformCallId: z.string().uuid().nullable().optional(),
+  platformCallId: z.string().nullable().optional(),
   request: z.unknown().optional(),
   rawResponse: z.unknown().optional(),
   decoder: z.unknown().optional(),

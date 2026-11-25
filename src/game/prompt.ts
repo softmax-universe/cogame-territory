@@ -64,24 +64,16 @@ export const SUBMISSION_JSON_SCHEMA = {
   required: ["orders"],
 } as const;
 
-const REPLY_CONTRACT = `REPLY CONTRACT
-- Return one JSON object. \`orders\` is 0..${MAX_ORDERS_PER_TURN} entries; an empty list is a legal hold.
-- \`messages\` is 0..${MAX_LINES} lines, each <= ${MAX_SAY_LEN} characters; \`to\` is null for a public
-  broadcast or a Cog alias for a private DM. Extra lines are dropped. Talk is free,
-  binds nobody, and every other Cog remembers what you promised.
-- \`note\` is <= ${MAX_NOTE_LEN} characters and is read by spectators only.
-- Your reply MUST begin with \`{\` and
-  contain nothing but the JSON object.
+const REPLY_CONTRACT = `REPLY FORMAT
+- Reply with one JSON object (raw JSON or a single \`\`\`json fenced block):
+  {"orders": [...], "messages": [...]}
+- \`orders\` (required): 0..${MAX_ORDERS_PER_TURN} entries; [] holds.
+  Order entries: {"type":"claim","tile":"q,r"}, {"type":"raze","tile":"q,r"}, or {"type":"transfer","to":"Alias","amount":N}.
+- \`messages\` (optional): 0..${MAX_LINES} lines, each {"to": null | "Alias", "text": "..."} (<= ${MAX_SAY_LEN} chars).
+  \`to: null\` broadcasts publicly; an alias sends a private DM. Talk is free and non-binding.
 
-A WORKED TURN
-  You are Cobalt with 14 paint, holding 3 tiles. \`reach\` offers "4,-2" (yield 3, distance 1)
-  and "3,-1" (yield 1, distance 2). \`razeReach\` offers "3,-2", a yield-3 wall Sable owns.
-  Claiming "4,-2" costs 4 and pays 3/turn forever. Razing "3,-2" costs 5, pays nothing, and
-  burns 2 yield off the board permanently. A steward claims and proposes a border; a
-  condottiere claims, then sells Sable protection. Either way you spend at most 14.
-  { "orders": [{"type":"claim","tile":"4,-2"}],
-    "messages": [{"to": null, "text": "Cobalt takes 4,-2. Sable, the ridge east of 3,-2 is yours if you leave my hearth alone."}],
-    "note": "cheap rich wall, open with a border offer" }`;
+EXAMPLE
+  {"orders":[{"type":"claim","tile":"4,-2"}],"messages":[{"to":null,"text":"Cobalt claims 4,-2."}]}`;
 
 const RULES = `You are one of nine Cogs painting your claim onto a hex lattice of resource walls.
 
@@ -389,9 +381,7 @@ export function renderPlayerMessages(
   return [
     {
       role: "system" as const,
-      content:
-        systemPrompt(doctrine, selection) +
-        `\nReturn JSON matching this schema: ${JSON.stringify(SUBMISSION_JSON_SCHEMA)}`,
+      content: systemPrompt(doctrine, selection),
     },
     { role: "user" as const, content: renderObservation(view) + host },
   ];

@@ -7,10 +7,10 @@
 // file:// (and bare paths) are implemented; s3:// is a defined seam that throws
 // until a host wires an S3 client. Fail loud — a missing URI, bad scheme, or
 // non-2xx HTTP throws rather than silently degrading.
-import { readFile, writeFile, mkdir, chmod } from "node:fs/promises";
+import { readFile, writeFile, mkdir, chmod, rename } from "node:fs/promises";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ZodType } from "zod";
+import { z, type ZodType } from "zod";
 
 const USER_AGENT = "cogweb-coworld/0.1";
 
@@ -72,6 +72,18 @@ export const RESULTS_URI_ENV = "COGAME_RESULTS_URI";
 // The platform runner injects the replay sink as COGAME_SAVE_REPLAY_URI
 // (COGAME_LOAD_REPLAY_URI is the replay-mode source); match it exactly.
 export const REPLAY_URI_ENV = "COGAME_SAVE_REPLAY_URI";
+export const PLAYER_FAILURE_URI_ENV = "COGAME_PLAYER_FAILURE_URI";
+
+/** Platform-compatible terminal player/episode failure declaration. */
+export const GamePlayerFailureSchema = z
+  .object({
+    message: z.string().min(1).max(2000),
+    failed_policy_index: z.number().int().nonnegative(),
+    kind: z.enum(["player_error", "episode_inconclusive"]),
+  })
+  .strict();
+
+export type GamePlayerFailure = z.infer<typeof GamePlayerFailureSchema>;
 
 function requireEnv(name: string): string {
   const v = process.env[name];
@@ -109,6 +121,27 @@ export async function writeReplay(replay: unknown): Promise<void> {
 /** Whether a replay sink is configured (the artifact is optional). */
 export function hasReplayUri(): boolean {
   return Boolean(process.env[REPLAY_URI_ENV]);
+}
+
+/** Write a typed terminal failure to `COGAME_PLAYER_FAILURE_URI` atomically. */
+export async function writePlayerFailure(failure: GamePlayerFailure): Promise<boolean> {
+  const uri = process.env[PLAYER_FAILURE_URI_ENV];
+  if (!uri) return false;
+  const validated = GamePlayerFailureSchema.parse({
+    ...failure,
+    message: failure.message.slice(0, 2000) || "player failure",
+  });
+  const payload = JSON.stringify(validated);
+  if (uri.startsWith("http://") || uri.startsWith("https://") || uri.startsWith("s3://")) {
+    await writeBytes(uri, payload, "application/json");
+    return true;
+  }
+  const path = localPath(uri);
+  const tmpPath = `${path}.tmp`;
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(tmpPath, payload, "utf-8");
+  await rename(tmpPath, path);
+  return true;
 }
 
 /** Whole-episode private evidence, kept outside public replay and process logs. */

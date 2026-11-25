@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { recordAttemptSnapshot } from "@cogweb/core";
 import type { ActAttempt, TextGeneration } from "@cogweb/protocol";
 import { OpenRouterLlmClient, llmUsageTotals, resetLlmUsage } from "../src/openrouter.js";
-import { robustDecide } from "../src/robust-decide.js";
+import { parseJsonAction, robustDecide } from "../src/robust-decide.js";
 
 const callId = "01234567-89ab-4cde-8123-456789abcdef";
 const response = {
@@ -141,5 +141,21 @@ describe("native direct text action", () => {
     expect(attempts[1]!.generation!.messages[1]!.content).toBe("view\nillegal take");
     expect(attempts[1]!.parsedAction).toEqual(result);
     expect(markFallback).not.toHaveBeenCalled();
+  });
+
+  it("parses primary raw JSON or a single fenced block and rejects brace scraping and ambiguity", () => {
+    expect(parseJsonAction('{"orders":[]}')).toEqual({ kind: "parsed", value: { orders: [] } });
+    expect(parseJsonAction('```json\n{"orders":[{"type":"claim","tile":"1,0"}]}\n```')).toEqual({
+      kind: "parsed",
+      value: { orders: [{ type: "claim", tile: "1,0" }] },
+    });
+    expect(parseJsonAction('I will play {"orders":[]} now.')).toMatchObject({ kind: "rejected" });
+    expect(
+      parseJsonAction('```json\n{"orders":[]}\n```\nor\n```json\n{"orders":[]}\n```'),
+    ).toMatchObject({ kind: "rejected", reason: expect.stringContaining("ambiguous") });
+    expect(parseJsonAction('Maybe {"orders":[]} or\n```json\n{"orders":[]}\n```')).toMatchObject({
+      kind: "rejected",
+      reason: expect.stringContaining("ambiguous"),
+    });
   });
 });

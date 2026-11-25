@@ -25,13 +25,20 @@ import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
 import type { ZodType } from "zod";
 
-import { GameRunner } from "@cogweb/core";
+import { GameRunner, SeatFailureError } from "@cogweb/core";
 import type { GameModule, ObservedMessage, SeatPilot } from "@cogweb/core";
 import { llmUsageTotals, MessageBus } from "@cogweb/llm";
 import type { Audience, FeedEvent, ServerMessage } from "@cogweb/protocol";
 
 import { RemotePlayerPilot, type TalkDelivery } from "./remote-pilot";
-import { readConfig, writeResults, writeReplay, writeTrajectory, hasReplayUri } from "./artifacts";
+import {
+  readConfig,
+  writeResults,
+  writeReplay,
+  writeTrajectory,
+  writePlayerFailure,
+  hasReplayUri,
+} from "./artifacts";
 import { PROTOCOL, type TalkLine } from "./protocol";
 
 const PLAYER_PATH = "/player";
@@ -194,7 +201,29 @@ export interface CoworldHostOpts<State, Decision, Results> {
    *  (`ReplayArtifact` is `.passthrough()`), so the saved replay is
    *  SELF-SUFFICIENT: the viewer needs nothing but the file. */
   replayMeta?: (state: State, results: Results) => Record<string, unknown>;
+  /** When true, fail the episode and write `COGAME_PLAYER_FAILURE_URI` instead
+   *  of substituting baseline decisions and emitting default gameplay scores. */
+  failOnSeatFailure?: boolean;
   client: CoworldClient;
+}
+
+function classifyFailureKind(reason: string): "player_error" | "episode_inconclusive" {
+  const lower = reason.toLowerCase();
+  if (
+    /text completion failed \((429|5\d\d)\)/.test(lower) ||
+    lower.includes("fetch failed") ||
+    lower.includes("econnrefused") ||
+    lower.includes("etimedout") ||
+    lower.includes("econnreset") ||
+    lower.includes("socket hang up") ||
+    lower.includes("network") ||
+    lower.includes("provider_unavailable") ||
+    lower.includes("provider_transport") ||
+    lower.includes("platform_error")
+  ) {
+    return "episode_inconclusive";
+  }
+  return "player_error";
 }
 
 export interface CoworldHostHandle<Results> {
@@ -509,6 +538,7 @@ export async function runCoworldHost<State, Decision, Results>(
     autoAdvance: opts.runner?.autoAdvance,
     simultaneousPaceMs: opts.runner?.simultaneousPaceMs,
     episodeDeadlineMs: opts.runner?.episodeDeadlineMs,
+    failOnSeatFailure: opts.failOnSeatFailure,
     // Coworld episodes must be deterministic + reproducible, so any free-form timed
     // phase (Game.openPhase, e.g. werecog's discussion window) collapses to an
     // instant here — its wall-clock would break replay/eval parity.
@@ -565,11 +595,109 @@ export async function runCoworldHost<State, Decision, Results>(
   const scoresFor =
     opts.scoresFor ?? ((score, n) => Array.from({ length: n }, (_, seat) => score[seat] ?? 0));
 
+  const finishPlayers = async (scores: number[]): Promise<void> => {
+    const finalFrame = JSON.stringify({ type: "final", scores });
+    const uploads: Promise<void>[] = [];
+    for (let slot = 0; slot < slots; slot++) {
+      const slotEnds = endsFor(slot);
+      const player = slotEnds.player;
+      if (player?.readyState !== WebSocket.OPEN) continue;
+      if (!slotEnds.artifactCompletionExpected) {
+        player.send(finalFrame);
+        continue;
+      }
+      uploads.push(
+        new Promise<void>((resolve, reject) => {
+          const onClose = () => {
+            clearTimeout(timeout);
+            pendingUploads.delete(slot);
+            reject(new Error(`Player ${slot} disconnected before artifact completion`));
+          };
+          const timeout = setTimeout(() => {
+            player.off("close", onClose);
+            pendingUploads.delete(slot);
+            reject(new Error(`Player ${slot} artifact upload timed out`));
+          }, PLAYER_UPLOAD_TIMEOUT_MS);
+          player.once("close", onClose);
+          pendingUploads.set(slot, () => {
+            clearTimeout(timeout);
+            player.off("close", onClose);
+            resolve();
+          });
+          player.send(finalFrame);
+        }),
+      );
+    }
+    await Promise.allSettled(uploads);
+  };
+
   const finished = (async (): Promise<Results> => {
-    // Wait for every external player to connect before driving; a straggler past
-    // the deadline is left to the baseline fallback so it can't stall the host.
+    // Wait for every external player to connect before driving.
     await Promise.race([allPlayersConnected, sleep(opts.connectDeadlineMs)]);
-    await runner!.start();
+    try {
+      if (opts.failOnSeatFailure && connectedPlayers.size < slots) {
+        let missingSlot = 0;
+        for (let slot = 0; slot < slots; slot++) {
+          if (!connectedPlayers.has(slot)) {
+            missingSlot = slot;
+            break;
+          }
+        }
+        throw new SeatFailureError({
+          seat: missingSlot,
+          turn: opts.module.game.turnOf(runner!.state),
+          reason: `player slot ${missingSlot} did not connect within ${opts.connectDeadlineMs}ms`,
+          attempts: [],
+        });
+      }
+      await runner!.start();
+    } catch (err) {
+      if (opts.failOnSeatFailure && err instanceof SeatFailureError) {
+        const failureKind = classifyFailureKind(err.reason);
+        const partialScores = scoresFor(opts.module.game.score(runner!.state), slots);
+        await finishPlayers(partialScores);
+        await writeTrajectory({
+          schema_version: "1",
+          episode: {
+            schema_version: "1",
+            event_type: "episode",
+            event_id: randomUUID(),
+            recorded_at: new Date().toISOString(),
+            episode_id: episodeId,
+            seed_family: runner!.evidenceSeed,
+            ...provenance,
+            status: failureKind === "episode_inconclusive" ? "inconclusive" : "failed",
+            outcome: {
+              failed_seat: err.seat,
+              failure_kind: failureKind,
+              error: err.reason,
+              turns_played: opts.module.game.turnOf(runner!.state),
+              environment_decisions: environmentDecisions,
+            },
+            participant_outcomes: null,
+          },
+          decisions,
+        });
+        if (hasReplayUri()) {
+          await writeReplay({
+            protocol: "cogweb.replay.v1",
+            frames: replayFrames,
+            usage: llmUsageTotals(),
+            failure: {
+              kind: failureKind,
+              failed_policy_index: err.seat,
+              message: err.message,
+            },
+          });
+        }
+        await writePlayerFailure({
+          message: err.message,
+          failed_policy_index: err.seat,
+          kind: failureKind,
+        });
+      }
+      throw err;
+    }
 
     const scoreBySeat = opts.module.game.score(runner!.state);
     const scores = scoresFor(scoreBySeat, slots);
@@ -798,13 +926,21 @@ export async function runCoworldGameCli<Config, Results extends { scores: number
     console.log(`[${opts.name}]   slot ${slot}: ${url}`);
   }
 
-  const results = await handle.finished;
-  console.log(`[${opts.name}] episode finished; scores=${JSON.stringify(results.scores)}`);
-  const linger = opts.shutdownGraceMs ?? 0;
-  if (linger > 0) {
-    console.log(`[${opts.name}] lingering ${linger}ms so the worker can finish its checks`);
-    await sleep(linger);
+  try {
+    const results = await handle.finished;
+    console.log(`[${opts.name}] episode finished; scores=${JSON.stringify(results.scores)}`);
+    const linger = opts.shutdownGraceMs ?? 0;
+    if (linger > 0) {
+      console.log(`[${opts.name}] lingering ${linger}ms so the worker can finish its checks`);
+      await sleep(linger);
+    }
+    await handle.close();
+    process.exit(0);
+  } catch (err) {
+    console.error(
+      `[${opts.name}] episode failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    await handle.close();
+    process.exit(1);
   }
-  await handle.close();
-  process.exit(0);
 }

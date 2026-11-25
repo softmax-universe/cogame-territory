@@ -16,28 +16,47 @@ import { isCredentialsUnavailable } from "./openrouter.js";
 import type { OpenRouterLlmClient, LlmMessage } from "./openrouter.js";
 
 /**
- * Pull the first JSON object out of a model reply (handles ```json fences and
- * surrounding prose). Throws if none parses — that throw is caught by the loop
- * and re-prompted like any other rejection.
+ * Parse a primary native JSON object reply, optionally wrapped in a single
+ * fenced code block. Never scrapes braces out of surrounding prose, and rejects
+ * ambiguous multi-block or competing-JSON replies so raw output is preserved.
  */
 export function parseJsonAction(
   text: string,
 ): { kind: "parsed"; value: unknown } | { kind: "rejected"; reason: string } {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
-  const braced = (() => {
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    return start >= 0 && end > start ? text.slice(start, end + 1) : undefined;
-  })();
-  for (const candidate of [fenced, braced, text]) {
-    if (!candidate) continue;
+  const trimmed = text.trim();
+  if (!trimmed) return { kind: "rejected", reason: "empty reply" };
+
+  const parsePlainObject = (raw: string): unknown | null => {
     try {
-      return { kind: "parsed", value: JSON.parse(candidate) };
+      const value: unknown = JSON.parse(raw);
+      return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
     } catch {
-      // try the next candidate; if all fail we throw below.
+      return null;
     }
+  };
+
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    const direct = parsePlainObject(trimmed);
+    if (direct !== null) return { kind: "parsed", value: direct };
+    return { kind: "rejected", reason: "invalid JSON object in reply" };
   }
-  return { kind: "rejected", reason: "no JSON object in reply" };
+
+  const fences = [...trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)];
+  if (fences.length > 1) {
+    return { kind: "rejected", reason: "ambiguous reply: multiple fenced blocks" };
+  }
+  if (fences.length === 1) {
+    const outside = trimmed.replace(fences[0]![0], "").trim();
+    if (outside.includes("{") || outside.includes("}")) {
+      return { kind: "rejected", reason: "ambiguous reply: JSON outside fenced block" };
+    }
+    const inner = fences[0]![1]!.trim();
+    const parsed = parsePlainObject(inner);
+    if (parsed !== null) return { kind: "parsed", value: parsed };
+    return { kind: "rejected", reason: "invalid JSON object in fenced block" };
+  }
+
+  return { kind: "rejected", reason: "reply must be a JSON object or single fenced JSON block" };
 }
 
 export function extractJson(text: string): unknown {

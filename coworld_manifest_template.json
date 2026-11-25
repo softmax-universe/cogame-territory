@@ -241,12 +241,27 @@
         "/bin/territory-player"
       ],
       "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      },
+      "source_url": "https://github.com/softmax-universe/cogame-territory/tree/main",
+      "id": "territory-llm",
+      "name": "Territory LLM",
+      "description": "Native LLM player using the hosted Coworld model endpoint (COWORLD_LLM_ENDPOINT) and selectable model (COWORLD_LLM_MODEL)."
+    },
+    {
+      "type": "player",
+      "image": "{{TERRITORY_IMAGE}}",
+      "run": [
+        "/bin/territory-player"
+      ],
+      "env": {
         "PLAYER_SCRIPTED": "homesteader"
       },
       "source_url": "https://github.com/softmax-universe/cogame-territory/tree/main",
       "id": "territory-homesteader",
       "name": "Territory Homesteader",
-      "description": "Deterministic no-LLM baseline: claims the richest reachable wall it can afford, never razes. Always legal, so it certifies the contract offline."
+      "description": "Deterministic no-LLM baseline: claims the richest reachable wall it can afford, never razes."
     },
     {
       "type": "player",
@@ -429,7 +444,7 @@
     },
     "players": [
       {
-        "player_id": "territory-homesteader"
+        "player_id": "territory-llm"
       },
       {
         "player_id": "territory-homesteader"
