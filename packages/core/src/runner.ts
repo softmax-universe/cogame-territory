@@ -27,6 +27,24 @@ import {
 
 export type RunMessageListener = (m: ServerMessage) => void;
 
+/** Thrown by `GameRunner.start()` when `failOnSeatFailure` is enabled and a seat
+ *  fails to produce a valid decision (backend error, invalid model, timeout,
+ *  disconnect, unparseable/ambiguous output, or repeated illegal move). */
+export class SeatFailureError extends Error {
+  readonly seat: number;
+  readonly turn: number;
+  readonly reason: string;
+  readonly attempts: ActAttempt[];
+  constructor(opts: { seat: number; turn: number; reason: string; attempts: ActAttempt[] }) {
+    super(`seat ${opts.seat} failed on turn ${opts.turn}: ${opts.reason}`);
+    this.name = "SeatFailureError";
+    this.seat = opts.seat;
+    this.turn = opts.turn;
+    this.reason = opts.reason;
+    this.attempts = opts.attempts;
+  }
+}
+
 /** Exact attempts stay private. Public replay keeps only redacted outcomes. */
 const publicPrompt = (wire: ActPromptWire, executedAction: unknown): ActPromptWire => ({
   ...wire,
@@ -90,6 +108,9 @@ export interface GameRunnerOptions {
   openPhaseTimeoutMs?: number;
   /** Notified when the game finishes (the lobby flips to "finished"). */
   onFinished?: (scores: Record<number, number>) => void;
+  /** When true, abort the episode with `SeatFailureError` instead of substituting
+   *  `baselineDecision` when a seat fails or times out. */
+  failOnSeatFailure?: boolean;
 }
 
 /** The runner's view of one seat's pilot plus its operator guidance. */
@@ -119,6 +140,7 @@ export class GameRunner<State, Decision> {
   readonly #openPhaseTimeoutMs?: number;
   readonly #onDecision?: (event: DecisionTelemetryEvent<unknown>) => void;
   readonly #onFinished?: (scores: Record<number, number>) => void;
+  readonly #failOnSeatFailure: boolean;
   /** The seed a host pinned (coworld league / deterministic eval), or undefined
    *  when none was pinned — in which case each game gets a fresh random seed. */
   readonly #pinnedSeed: string | undefined;
@@ -186,6 +208,7 @@ export class GameRunner<State, Decision> {
     this.#openPhaseTimeoutMs = opts.openPhaseTimeoutMs;
     this.#onFinished = opts.onFinished;
     this.#onDecision = opts.onDecision;
+    this.#failOnSeatFailure = opts.failOnSeatFailure ?? false;
     this.#pinnedSeed = opts.seed;
     this.#rules = opts.rules;
     this.#seed = this.#nextSeed();
@@ -516,6 +539,31 @@ export class GameRunner<State, Decision> {
     for (const seat of pending) this.#thinking.delete(seat);
     if (gen !== this.#generation) return true;
 
+    if (this.#failOnSeatFailure) {
+      const failed = outcomes.find((o) => o.failedReason !== null);
+      if (failed) {
+        for (const outcome of outcomes) {
+          this.#onDecision?.({
+            seat: outcome.seat,
+            turn: this.#game.turnOf(stateAtTurn),
+            observation: this.#game.redact(stateAtTurn, outcome.seat),
+            decision: outcome.decision,
+            attempts: outcome.wire.attempts,
+            status: outcome.failedReason !== null || outcome.wire.usedFallback ? "fallback" : "accepted",
+            purpose: outcome.purpose,
+            pilotKind: outcome.pilotKind,
+            policy: outcome.policy,
+          });
+        }
+        throw new SeatFailureError({
+          seat: failed.seat,
+          turn: this.#game.turnOf(stateAtTurn),
+          reason: failed.failedReason!,
+          attempts: failed.wire.attempts,
+        });
+      }
+    }
+
     for (const outcome of outcomes) {
       this.#emit({ type: "actPrompt", actPrompt: publicPrompt(outcome.wire, outcome.decision) });
       this.#apply(outcome.seat, outcome.decision);
@@ -567,6 +615,7 @@ export class GameRunner<State, Decision> {
     purpose: SeatPilot<State, Decision>["purpose"];
     pilotKind: SeatPilot<State, Decision>["pilot"]["kind"];
     policy: string | null;
+    failedReason: string | null;
   }> {
     const seatPilot = this.#pilots.get(seat);
     if (!seatPilot) throw new Error(`no pilot registered for pending seat ${seat}`);
@@ -575,6 +624,7 @@ export class GameRunner<State, Decision> {
     this.#activeDecisions.add(controller);
     let sealed = false;
     let usedFallback = false;
+    let failedReason: string | null = null;
     const ctx = this.#makeContext(
       seat,
       stateAtTurn,
@@ -603,6 +653,7 @@ export class GameRunner<State, Decision> {
       const outcome = guard ? await Promise.race([decided, guard]) : await decided;
       if (outcome === "advance") {
         usedFallback = true;
+        failedReason = `no reply within ${this.#maxTimeMs}ms`;
         controller.abort(new Error("Decision deadline expired"));
         seatPilot.pilot.abort?.(seat);
         const joinTimer: { id: ReturnType<typeof setTimeout> | null } = { id: null };
@@ -623,7 +674,8 @@ export class GameRunner<State, Decision> {
         decision = outcome.d;
       } else {
         usedFallback = true;
-        attempts.push({ prompt: "", response: "", error: errorMessage(outcome.e) });
+        failedReason = errorMessage(outcome.e);
+        attempts.push({ prompt: "", response: "", error: failedReason });
         decision = this.#game.baselineDecision(stateAtTurn, seat);
       }
     } finally {
@@ -647,6 +699,7 @@ export class GameRunner<State, Decision> {
       purpose: seatPilot.purpose,
       pilotKind: seatPilot.pilot.kind,
       policy: seatPilot.name || seatPilot.model,
+      failedReason,
     };
   }
 

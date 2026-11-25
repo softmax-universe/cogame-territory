@@ -52,11 +52,15 @@ export {
   readConfig,
   writeResults,
   writeReplay,
+  writePlayerFailure,
   hasReplayUri,
   CONFIG_URI_ENV,
   RESULTS_URI_ENV,
   REPLAY_URI_ENV,
+  PLAYER_FAILURE_URI_ENV,
+  GamePlayerFailureSchema,
 } from "./artifacts";
+export type { GamePlayerFailure } from "./artifacts";
 
 // Headless policy-evaluation harness: deterministic local evals, no network.
 export { runMatchup, comparePolicies } from "./eval";

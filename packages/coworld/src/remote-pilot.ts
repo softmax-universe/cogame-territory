@@ -192,8 +192,7 @@ export class RemotePlayerPilot<State, Decision> implements Pilot<State, Decision
           ctx.recordSpeech(raw.speechAttempts, [], true);
           for (const evidence of raw.attempts)
             ctx.recordAttempt({ ...evidence, error: evidence.error ?? raw.error });
-          reason = raw.error;
-          continue;
+          throw new Error(raw.error);
         }
         if (raw.usedFallback) ctx.markFallback();
         ctx.recordSpeech(raw.speechAttempts ?? [], raw.messages, raw.speechUsedFallback ?? false);

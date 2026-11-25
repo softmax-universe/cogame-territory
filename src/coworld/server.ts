@@ -68,6 +68,7 @@ export function runCoworldGame(opts: CoworldGameOptions): Promise<CoworldGameHan
     port: opts.port,
     connectDeadlineMs: CONNECT_DEADLINE_MS,
     actTimeoutMs: ACT_TIMEOUT_MS,
+    failOnSeatFailure: true,
     runner: {
       autoAdvance: { enabled: true, maxTimeMs: ACT_TIMEOUT_MS },
       simultaneousPaceMs: configPaceMs(config),

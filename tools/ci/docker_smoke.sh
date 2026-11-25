@@ -171,11 +171,14 @@ for slot in range(seats):
     for kv in extra_env:
         env_args += ["-e", kv]
     argv = list(entry.get("run") or [player_bin])
+    is_llm = str((entry.get("env") or {}).get("COWORLD_LLM_ENABLED", "")).lower() == "true"
     with open(os.path.join(work, f"env-{slot}.args"), "w") as fh:
         fh.write(" ".join(shlex.quote(a) for a in env_args))
     with open(os.path.join(work, f"cmd-{slot}.args"), "w") as fh:
         fh.write(" ".join(shlex.quote(a) for a in argv))
-    print(f"slot {slot}: player_id={player_id or '(default)'} run={argv} env={len(env_args) // 2}")
+    with open(os.path.join(work, f"llm-{slot}"), "w") as fh:
+        fh.write("1" if is_llm else "0")
+    print(f"slot {slot}: player_id={player_id or '(default)'} run={argv} env={len(env_args) // 2} llm={is_llm}")
 
 with open(os.path.join(work, "seats"), "w") as fh:
     fh.write(str(seats))
@@ -190,10 +193,56 @@ chmod 777 "${work_dir}"
 # --------------------------------------------------------------------------
 docker network create "${network}" >/dev/null
 
-player_env=()
-for name in COWORLD_LLM_ENDPOINT COWORLD_LLM_MODEL OPENROUTER_API_KEY; do
+llm_player_env=()
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  llm_player_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+else
+  needs_mock_llm=0
+  for ((slot = 0; slot < seats; slot++)); do
+    if [ "$(cat "${work_dir}/llm-${slot}")" = "1" ]; then
+      needs_mock_llm=1
+      break
+    fi
+  done
+  if [ "${needs_mock_llm}" = "1" ]; then
+    echo "starting keyless CI mock OpenAI-compatible LLM server (${prefix}-llm) ..."
+    docker run -d --name "${prefix}-llm" \
+      --network "${network}" --network-alias "${prefix}-llm" \
+      "${image}" node -e '
+        const http = require("node:http");
+        const { randomUUID } = require("node:crypto");
+        let calls = 0;
+        http.createServer((req, res) => {
+          let body = "";
+          req.on("data", (c) => { body += c; });
+          req.on("end", () => {
+            calls++;
+            const parsed = JSON.parse(body || "{}");
+            const userMsg = (parsed.messages || []).find((m) => m.role === "user")?.content || "";
+            const reachLine = (userMsg.match(/REACH[^\n]*\n\s+([^\n]+)/) || [])[1] || "";
+            const paintMatch = userMsg.match(/paint (\d+)/);
+            const paint = paintMatch ? Number(paintMatch[1]) : 0;
+            const firstTile = (reachLine.match(/(-?\d+,-?\d+)\(/) || [])[1];
+            const orders = firstTile && paint >= 6 ? [{ type: "claim", tile: firstTile }] : [];
+            const content = JSON.stringify({ orders, messages: [] });
+            const callId = randomUUID();
+            const out = {
+              id: callId,
+              model: parsed.model || "anthropic/claude-haiku-4.5",
+              choices: [{ message: { role: "assistant", content }, finish_reason: "stop" }],
+              usage: { prompt_tokens: 10, completion_tokens: 10 },
+            };
+            res.writeHead(200, { "content-type": "application/json", "X-Softmax-Llm-Call-Id": callId });
+            res.end(JSON.stringify(out));
+          });
+        }).listen(8081, "0.0.0.0", () => console.log("mock-llm listening on 8081"));
+      ' >/dev/null
+    llm_player_env+=(-e "COWORLD_LLM_ENDPOINT=http://${prefix}-llm:8081")
+  fi
+fi
+for name in COWORLD_LLM_MODEL OPENROUTER_API_KEY; do
   if [ -n "${!name:-}" ]; then
-    player_env+=(-e "${name}=${!name}")
+    llm_player_env+=(-e "${name}=${!name}")
   fi
 done
 
@@ -212,10 +261,14 @@ docker run -d --name "${prefix}-game" \
 for ((slot = 0; slot < seats; slot++)); do
   eval "penv=( $(cat "${work_dir}/env-${slot}.args") )"
   eval "pcmd=( $(cat "${work_dir}/cmd-${slot}.args") )"
+  slot_llm_env=()
+  if [ "$(cat "${work_dir}/llm-${slot}")" = "1" ]; then
+    slot_llm_env=(${llm_player_env[@]+"${llm_player_env[@]}"})
+  fi
   docker run -d --name "${prefix}-p${slot}" --network "${network}" \
     -e COWORLD_PLAYER_WS_URL="ws://${prefix}-game:${port}/player?slot=${slot}&token=token-${slot}" \
     ${penv[@]+"${penv[@]}"} \
-    ${player_env[@]+"${player_env[@]}"} \
+    ${slot_llm_env[@]+"${slot_llm_env[@]}"} \
     "${image}" ${pcmd[@]+"${pcmd[@]}"} >/dev/null
 done
 

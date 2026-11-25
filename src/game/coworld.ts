@@ -180,6 +180,21 @@ const resultsSchema: JsonSchema = {
 const players: PlayerRunnable[] = [
   {
     type: "player",
+    id: "territory-llm",
+    name: "Territory LLM",
+    image: TERRITORY_IMAGE,
+    run: ["/bin/territory-player"],
+    env: {
+      COWORLD_LLM_ENABLED: "true",
+      COWORLD_LLM_MODEL: "anthropic/claude-haiku-4.5",
+    },
+    source_url: SOURCE_TREE,
+    description:
+      "Native LLM player using the hosted Coworld model endpoint (COWORLD_LLM_ENDPOINT) " +
+      "and selectable model (COWORLD_LLM_MODEL).",
+  },
+  {
+    type: "player",
     id: "territory-homesteader",
     name: "Territory Homesteader",
     image: TERRITORY_IMAGE,
@@ -188,7 +203,7 @@ const players: PlayerRunnable[] = [
     source_url: SOURCE_TREE,
     description:
       "Deterministic no-LLM baseline: claims the richest reachable wall it can afford, never " +
-      "razes. Always legal, so it certifies the contract offline.",
+      "razes.",
   },
   {
     type: "player",
@@ -482,7 +497,8 @@ export function buildTerritoryManifest(): CoworldManifest {
         players: PLACEHOLDER_PLAYERS,
       },
       players: [
-        ...Array.from({ length: 5 }, () => ({ player_id: "territory-homesteader" })),
+        { player_id: "territory-llm" },
+        ...Array.from({ length: 4 }, () => ({ player_id: "territory-homesteader" })),
         ...Array.from({ length: 4 }, () => ({ player_id: "territory-raider" })),
       ],
     },

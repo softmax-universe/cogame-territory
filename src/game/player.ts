@@ -2,21 +2,23 @@ import { realpathSync } from "node:fs";
 // The ONE player entrypoint, shipped in the SAME image as the game and selected
 // by env — `dist-server/game/player.js`, shimmed as `/bin/territory-player`:
 //
-//   PLAYER_PROMPT=<doctrine> or COWORLD_LLM_ENDPOINT  LLM policy (empty hold on invalid output)
 //   PLAYER_SCRIPTED=homesteader | raider              that explicit scripted baseline
-//   neither set (keyless CI smoke)                    homesteader
+//   COWORLD_LLM_ENABLED=true / COWORLD_LLM_ENDPOINT /
+//   COWORLD_LLM_MODEL / PLAYER_PROMPT / OPENROUTER_API_KEY   LLM policy (fails closed, no fallback)
+//   none set                                          homesteader
 //
 // Native Coworld model selection uses canonical OpenRouter IDs.
 
 import { argv, env } from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { OpenRouterLlmClient, robustDecide } from "@cogweb/llm";
+import { OpenRouterLlmClient, parseJsonAction } from "@cogweb/llm";
+import type { TextGeneration } from "@cogweb/protocol";
 import { runCoworldPlayer } from "@cogweb/coworld";
 import type { PlayerDecideContext } from "@cogweb/coworld";
 
 import { SubmissionSchema } from "../shared/engine/orders.js";
-import { emptyHoldDecision, territoryModule } from "./game.js";
+import { territoryModule } from "./game.js";
 import type { TerritoryDecision, TerritorySeamState, TerritoryView } from "./game.js";
 import type { TerritoryObservation } from "./redact.js";
 import { renderPlayerMessages } from "./prompt.js";
@@ -26,13 +28,13 @@ import { promptSelectionSchema } from "./prompt-selection.js";
 type Ctx = PlayerDecideContext<TerritorySeamState, TerritoryDecision, TerritoryView>;
 
 /** Haiku 4.5. `maxTokens: 900` — 400 truncates ("cut off at max_tokens"). */
-const DEFAULT_MODEL = "anthropic/claude-haiku.4.5";
+const DEFAULT_MODEL = "anthropic/claude-haiku-4.5";
 const MAX_TOKENS = 900;
-/** One retry, then an explicit empty hold (`fallback: true`). */
-const MAX_ATTEMPTS = 2;
 
-/** The LLM policy: doctrine folded into the system prompt; exhausted or
- *  unparseable model output executes an observable empty hold, never a scripted bot. */
+/** The LLM policy: one direct native model call per observation.
+ *  Never substitutes a scripted or empty-hold action on backend, invalid-model,
+ *  parse, ambiguity, or schema failure — preserves raw output and throws so the
+ *  host records a terminal failure instead of default gameplay scores. */
 export function makeLlmDecide(doctrine: string): (ctx: Ctx) => Promise<TerritoryDecision> {
   const model = env.COWORLD_LLM_MODEL?.trim() || DEFAULT_MODEL;
   const client = new OpenRouterLlmClient({
@@ -43,32 +45,92 @@ export function makeLlmDecide(doctrine: string): (ctx: Ctx) => Promise<Territory
     const view = ctx.view as TerritoryObservation;
     const selection = promptSelectionSchema.parse(ctx.config);
     const messages = renderPlayerMessages(view, doctrine, ctx.reason, selection);
-    let usedFallback = true;
-    const decision = await robustDecide<TerritoryDecision>({
-      client,
-      purpose: { kind: "learner" },
-      signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(client.timeoutMs)]),
-      slot: ctx.playerSlot,
-      system: messages[0]!.content,
-      renderUser: (rejection) => {
-        return messages[1]!.content + (rejection ? `\n\n${rejection}` : "");
-      },
-      validate: (candidate) => {
-        const parsed = SubmissionSchema.parse(candidate);
-        usedFallback = false;
-        return parsed;
-      },
-      baseline: () => emptyHoldDecision(),
-      recordAttempt: ctx.recordAttempt,
-      markFallback: ctx.markFallback,
-      maxAttempts: MAX_ATTEMPTS,
-    });
-    if (usedFallback) {
-      console.log(
-        JSON.stringify({ kind: "player_fallback", seat: ctx.seat, turn: ctx.turn, action: "empty_hold" }),
-      );
+    const generationId = globalThis.crypto.randomUUID();
+    const purpose = { kind: "learner" as const };
+    const system = messages[0]!.content;
+    const userPrompt = messages[1]!.content;
+    let generation: TextGeneration | undefined;
+
+    let reply;
+    try {
+      reply = await client.complete({
+        purpose,
+        signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(client.timeoutMs)]),
+        slot: ctx.playerSlot,
+        system,
+        messages: [{ role: "user", text: userPrompt }],
+        recordGeneration: (evidence) => {
+          generation = evidence;
+          ctx.recordAttempt({
+            generationId,
+            purpose,
+            prompt: userPrompt,
+            response: evidence.response,
+            error: null,
+            generation: evidence,
+            platformCallId: evidence.platformCallId ?? null,
+            providerRequestId: evidence.providerRequestId ?? null,
+          });
+        },
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      ctx.recordAttempt({
+        generationId,
+        purpose,
+        prompt: userPrompt,
+        response: generation?.response ?? "",
+        error: reason,
+        generation,
+        platformCallId: generation?.platformCallId ?? null,
+        providerRequestId: generation?.providerRequestId ?? null,
+      });
+      throw err;
     }
-    return decision;
+
+    const parsedJson = parseJsonAction(reply.text);
+    if (parsedJson.kind === "rejected") {
+      ctx.recordAttempt({
+        generationId,
+        purpose,
+        prompt: userPrompt,
+        response: reply.text,
+        error: parsedJson.reason,
+        generation: reply.generation,
+        platformCallId: reply.platformCallId,
+        providerRequestId: reply.generation.providerRequestId ?? null,
+      });
+      throw new Error(parsedJson.reason);
+    }
+
+    const validated = SubmissionSchema.safeParse(parsedJson.value);
+    if (!validated.success) {
+      const reason = validated.error.message;
+      ctx.recordAttempt({
+        generationId,
+        purpose,
+        prompt: userPrompt,
+        response: reply.text,
+        error: reason,
+        generation: reply.generation,
+        platformCallId: reply.platformCallId,
+        providerRequestId: reply.generation.providerRequestId ?? null,
+      });
+      throw new Error(reason);
+    }
+
+    ctx.recordAttempt({
+      generationId,
+      purpose,
+      prompt: userPrompt,
+      response: reply.text,
+      error: null,
+      generation: reply.generation,
+      parsedAction: validated.data,
+      platformCallId: reply.platformCallId,
+      providerRequestId: reply.generation.providerRequestId ?? null,
+    });
+    return validated.data;
   };
 }
 
@@ -95,7 +157,10 @@ export function selectPlayerPolicy(
   if (scripted) return { kind: "scripted", baseline: scripted };
   const prompt = envVars.PLAYER_PROMPT?.trim();
   const endpoint = envVars.COWORLD_LLM_ENDPOINT?.trim();
-  if (prompt || endpoint) return { kind: "llm", prompt: prompt ?? "" };
+  const enabled = envVars.COWORLD_LLM_ENABLED?.trim().toLowerCase() === "true";
+  const model = envVars.COWORLD_LLM_MODEL?.trim();
+  const apiKey = envVars.OPENROUTER_API_KEY?.trim();
+  if (enabled || prompt || endpoint || model || apiKey) return { kind: "llm", prompt: prompt ?? "" };
   return { kind: "scripted", baseline: "homesteader" };
 }
 
@@ -104,7 +169,7 @@ export function run(): Promise<number[]> {
   const selected = selectPlayerPolicy(env);
   if (selected.kind === "llm") {
     console.log(
-      `[territory-player] LLM policy (model ${env.COWORLD_LLM_MODEL ?? DEFAULT_MODEL}, fallback empty_hold)`,
+      `[territory-player] LLM policy (model ${env.COWORLD_LLM_MODEL?.trim() || DEFAULT_MODEL}, fail-closed)`,
     );
     return runCoworldPlayer<TerritorySeamState, TerritoryDecision, TerritoryView>({
       module: territoryModule,

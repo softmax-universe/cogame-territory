@@ -86,18 +86,26 @@ describe("coworld_manifest_template.json", () => {
     expect(committed.certification.players).toHaveLength(SEATS);
   });
 
-  it("seats BOTH declared runnables in the certification fixture (homesteader x5, raider x4)", () => {
+  it("seats all declared runnables in the certification fixture (llm x1, homesteader x4, raider x4)", () => {
     const declared = committed.player.map((p: { id: string }) => p.id).sort();
-    expect(declared).toEqual(["territory-homesteader", "territory-raider"]);
+    expect(declared).toEqual(["territory-homesteader", "territory-llm", "territory-raider"]);
     const seated = committed.certification.players.map((p: { player_id: string }) => p.player_id);
-    expect(seated.filter((id: string) => id === "territory-homesteader")).toHaveLength(5);
+    expect(seated.filter((id: string) => id === "territory-llm")).toHaveLength(1);
+    expect(seated.filter((id: string) => id === "territory-homesteader")).toHaveLength(4);
     expect(seated.filter((id: string) => id === "territory-raider")).toHaveLength(4);
     for (const id of declared) expect(seated).toContain(id);
-    // Both run the ONE entrypoint and are switched by env.
+    // All run the ONE entrypoint and are switched by env.
     for (const p of committed.player) {
       expect(p.run).toEqual(["/bin/territory-player"]);
       expect(p.image).toBe("{{TERRITORY_IMAGE}}");
-      expect(Object.keys(p.env)).toEqual(["PLAYER_SCRIPTED"]);
+      if (p.id === "territory-llm") {
+        expect(p.env).toEqual({
+          COWORLD_LLM_ENABLED: "true",
+          COWORLD_LLM_MODEL: "anthropic/claude-haiku-4.5",
+        });
+      } else {
+        expect(Object.keys(p.env)).toEqual(["PLAYER_SCRIPTED"]);
+      }
       expect(p.description.length).toBeGreaterThan(20);
     }
   });
